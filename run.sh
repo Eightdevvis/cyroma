@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Launcher for macOS / Linux. Double-click won't work in a terminal-less GUI,
-# so open a Terminal, cd into this folder, and run:  ./run.sh
+# Launcher for macOS / Linux. Open a Terminal, cd into this folder, run:  ./run.sh
 set -e
 cd "$(dirname "$0")"
 
@@ -19,5 +18,5 @@ if command -v uv >/dev/null 2>&1; then
 fi
 
 echo "Couldn't install uv automatically. Fallback:"
-echo "  python3 -m venv .venv && . .venv/bin/activate && pip install textual aiortc aiohttp && python morse.py"
+echo "  python3 -m venv .venv && . .venv/bin/activate && pip install pygame numpy imageio-ffmpeg && python morse.py"
 exit 1

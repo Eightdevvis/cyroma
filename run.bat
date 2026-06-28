@@ -15,7 +15,7 @@ if %errorlevel%==0 goto run
 
 echo.
 echo Could not install uv automatically. Fallback:
-echo   python -m venv .venv ^&^& .venv\Scripts\activate ^&^& pip install textual aiortc aiohttp ^&^& python morse.py
+echo   python -m venv .venv ^&^& .venv\Scripts\activate ^&^& pip install pygame numpy imageio-ffmpeg windows-curses ^&^& python morse.py
 pause
 exit /b 1
 

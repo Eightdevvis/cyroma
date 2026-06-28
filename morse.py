@@ -1,993 +1,938 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.9"
 # dependencies = [
-#   "textual>=0.60",
-#   "aiortc>=1.9",
-#   "aiohttp>=3.9",
+#   "pygame>=2.5",
+#   "numpy>=1.24",
+#   "imageio-ffmpeg>=0.4",
+#   "windows-curses; sys_platform == 'win32'",
 # ]
 # ///
 """
-morse — a tiny peer-to-peer Morse-code radio in your terminal.
+morse — a Morse-code "cassette" deck that lives in your terminal.
 
-A single glowing dot blinks Morse. Underneath, a monospace menu lets you
-record/compose messages and replay received ones. Two people connect directly
-(WebRTC data channel) by emailing each other a one-line connection code — no
-server in the middle.
+Keyboard only, no mouse, no window. Two things:
+
+  • Select Cassette — browse to an audio file (mp3/wav/…), then watch it play
+    back as a scrolling tape of tones and pauses. No letters: short block = dot,
+    long block = dash, dark = pause. You translate it yourself.
+
+  • Record Cassette — key Morse by hand ( . and - ), pauses included, hear every
+    beep, then type a path and save it as an mp3 or wav.
+
+Press  c  in either player to toggle the translation cheatsheet.
 
 Run:   uv run morse.py        (or: python morse.py  with deps installed)
 """
 
-from __future__ import annotations
-
-import asyncio
-import base64
-import getpass
+import os
+import sys
 import json
-import math
-import secrets
 import time
-import uuid
-import zlib
-from dataclasses import dataclass, asdict
-from pathlib import Path
+import wave
+import locale
+import curses
+import subprocess
+import tempfile
 
-import aiohttp
-from rich.color import Color
-from rich.style import Style
-from rich.text import Text
+# Keep pygame silent and headless — we only use its audio mixer, never a window.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
-from textual import events, work
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.message import Message
-from textual.widget import Widget
-from textual.widgets import Button, ContentSwitcher, Static, TextArea
+import numpy as np
+import pygame
+import imageio_ffmpeg
 
-from aiortc import (
-    RTCConfiguration,
-    RTCDataChannel,
-    RTCIceServer,
-    RTCPeerConnection,
-    RTCSessionDescription,
-)
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-# --------------------------------------------------------------------------- #
-# Morse code                                                                   #
-# --------------------------------------------------------------------------- #
+HERE = os.path.dirname(os.path.abspath(__file__))
+CHEATSHEET = os.path.join(HERE, "cheatsheet.txt")
+SETTINGS = os.environ.get("MORSE_SETTINGS") or os.path.join(HERE, "settings.json")
 
-MORSE = {
-    "A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".", "F": "..-.",
-    "G": "--.", "H": "....", "I": "..", "J": ".---", "K": "-.-", "L": ".-..",
-    "M": "--", "N": "-.", "O": "---", "P": ".--.", "Q": "--.-", "R": ".-.",
-    "S": "...", "T": "-", "U": "..-", "V": "...-", "W": ".--", "X": "-..-",
-    "Y": "-.--", "Z": "--..",
-    "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-",
-    "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.",
-    ".": ".-.-.-", ",": "--..--", "?": "..--..", "'": ".----.", "!": "-.-.--",
-    "/": "-..-.", "(": "-.--.", ")": "-.--.-", "&": ".-...", ":": "---...",
-    ";": "-.-.-.", "=": "-...-", "+": ".-.-.", "-": "-....-", "_": "..--.-",
-    '"': ".-..-.", "@": ".--.-.",
-}
-INV_MORSE = {v: k for k, v in MORSE.items()}
-
-# one "unit" of Morse timing, in seconds. higher = slower.
-UNIT = 0.11
+AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma"}
 
 
-def text_to_morse(text: str) -> str:
-    """'HI YO' -> '.... ..  / -.-- ---'  (letters by space, words by ' / ')."""
-    words = []
-    for word in text.upper().split():
-        words.append(" ".join(MORSE[c] for c in word if c in MORSE))
-    return " / ".join(w for w in words if w)
+# ───────────────────────────── tuning ──────────────────────────────────────
+
+RATE = 44100                # audio sample rate
+TONE_FREQ = 620             # default beep pitch (Hz)
+DOT, DASH = 0.09, 0.27      # default element lengths (s) — dash is 3× a dot
+TRACK_HZ = 100              # resolution of the on/off tape (samples per second)
+CPS = 22                    # Select tape scroll speed (columns per second)
+CPU = 2                     # Record tape: columns per unit (dot=2, dash=6)
+
+# recording style presets (the "sound" of the cassette you make)
+PITCHES = [300, 400, 500, 600, 700, 800, 1000, 1200]      # Hz
+WAVES = ["sine", "triangle", "square", "sawtooth"]        # timbre
+SPEEDS = [("v.slow", 0.16), ("slow", 0.12), ("normal", 0.08),
+          ("fast", 0.06), ("v.fast", 0.04)]               # (label, dot seconds)
+SHAPES = [("hard", 0.002, 0.004), ("normal", 0.006, 0.02),
+          ("soft", 0.012, 0.07), ("long", 0.012, 0.16)]   # (label, attack, release)
 
 
-def morse_to_text(morse: str) -> str:
-    out = []
-    for word in morse.strip().split(" / "):
-        letters = [INV_MORSE.get(sym, "·") for sym in word.split() if sym]
-        out.append("".join(letters))
-    return " ".join(w for w in out if w)
+# ─────────────────────────── audio helpers ─────────────────────────────────
+
+def make_tone(dur, freq=TONE_FREQ, wave="sine", amp=0.5,
+              attack=0.006, release=0.02, rate=RATE):
+    """A single beep of the given pitch/timbre.
+
+    `attack` is the fade-in (a short one keeps the onset crisp); `release` is a
+    decay tail appended *after* the tone — short = hard/choppy, long = a soft
+    ring-out ("Nachklang")."""
+    n = max(1, int(dur * rate))
+    rel = max(1, int(release * rate))
+    total = n + rel
+    ph = 2 * np.pi * freq * np.arange(total) / rate
+    if wave == "square":
+        w = np.sign(np.sin(ph)) * 0.7        # softer, it's harmonically rich
+    elif wave == "triangle":
+        w = 2 / np.pi * np.arcsin(np.sin(ph))
+    elif wave == "sawtooth":
+        w = (2 * (ph / (2 * np.pi) % 1.0) - 1) * 0.7
+    else:
+        w = np.sin(ph)
+    w = w * amp
+    env = np.ones(total)
+    a = min(n, max(1, int(attack * rate)))
+    env[:a] = np.linspace(0, 1, a)
+    env[n:] = np.linspace(1, 0, rel) ** 2    # convex decay = soft ring-out
+    return w * env
 
 
-def morse_timeline(morse: str) -> list[tuple[bool, int]]:
-    """Expand a Morse string into a list of (is_on, units) steps for playback."""
-    seq: list[tuple[bool, int]] = []
-    words = [w for w in morse.strip().split(" / ") if w]
-    for wi, word in enumerate(words):
-        letters = [l for l in word.split() if l]
-        for li, letter in enumerate(letters):
-            for si, sym in enumerate(letter):
-                seq.append((True, 3 if sym == "-" else 1))
-                if si < len(letter) - 1:
-                    seq.append((False, 1))          # gap between elements
-            if li < len(letters) - 1:
-                seq.append((False, 3))              # gap between letters
-        if wi < len(words) - 1:
-            seq.append((False, 7))                  # gap between words
-    return seq
+def float_to_sound(wave_):
+    """Turn a float waveform into a pygame Sound (mono mixer assumed)."""
+    return pygame.sndarray.make_sound((wave_ * 32767).astype(np.int16))
 
 
-# --------------------------------------------------------------------------- #
-# Stored messages                                                              #
-# --------------------------------------------------------------------------- #
-
-STORE = Path(__file__).resolve().parent / "messages.json"
+def _run_ffmpeg(args):
+    subprocess.run([FFMPEG, "-nostdin", "-y", *args],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-@dataclass
-class MorseMessage:
-    id: str
-    ts: float
-    text: str
-    morse: str
-    direction: str   # "sent" | "recv"
+def convert_to_wav(src, dst, rate=RATE):
+    """Decode any audio file into a mono PCM wav at `rate` via ffmpeg."""
+    _run_ffmpeg(["-i", src, "-ac", "1", "-ar", str(rate), dst])
+
+
+def load_wav(path):
+    """Read a PCM wav → (mono float32 samples in [-1,1], sample_rate)."""
+    with wave.open(path, "rb") as w:
+        rate = w.getframerate()
+        raw = w.readframes(w.getnframes())
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    return samples, rate
+
+
+def decode_audio(path):
+    """Load any audio file → (mono float32 samples in [-1,1], sample_rate)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    try:
+        convert_to_wav(path, tmp)
+        return load_wav(tmp)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def detect_tape(samples, rate):
+    """
+    Reduce a recording to a boolean on/off tape at TRACK_HZ.
+
+    Rectify, smooth into an amplitude envelope, then threshold: loud = a tone is
+    sounding, quiet = a pause.
+    """
+    env = np.abs(samples)
+    win = max(1, int(0.02 * rate))                  # 20 ms smoothing
+    env = np.convolve(env, np.ones(win) / win, mode="same")
+    thr = 0.18 * np.percentile(env, 99)             # adaptive to the recording
+    on = env > max(thr, 1e-4)
+
+    duration = len(samples) / rate
+    n = max(1, int(duration * TRACK_HZ))
+    idx = np.clip((np.arange(n) / TRACK_HZ * rate).astype(int), 0, len(on) - 1)
+    return on[idx], duration
+
+
+def _write_wav(path, pcm, rate=RATE):
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm.tobytes())
+
+
+def export_morse(events, path, freq=TONE_FREQ, wave="sine", amp=0.5):
+    """Render events into a beep track and write mp3/wav.
+
+    Each event is (start, end) — synthesized with the freq/wave args — or
+    (start, end, freq, wave[, attack, release]) to carry its own per-element style.
+    """
+    if not events:
+        return
+
+    def style(ev):
+        f, w = (ev[2], ev[3]) if len(ev) >= 4 else (freq, wave)
+        at, rl = (ev[4], ev[5]) if len(ev) >= 6 else (0.006, 0.02)
+        return f, w, at, rl
+
+    total = max(ev[1] + style(ev)[3] for ev in events) + 0.2   # room for ring-out
+    buf = np.zeros(int(total * RATE), dtype=np.float32)
+    for ev in events:
+        f, w, at, rl = style(ev)
+        tone = make_tone(ev[1] - ev[0], f, w, amp, at, rl)
+        i = int(ev[0] * RATE)
+        buf[i:i + len(tone)] += tone[: len(buf) - i]
+    pcm = (np.clip(buf, -1, 1) * 32767).astype(np.int16)
+
+    if path.lower().endswith(".wav"):
+        _write_wav(path, pcm)
+    else:
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+        try:
+            _write_wav(tmp, pcm)
+            _run_ffmpeg(["-i", tmp, path])
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+
+def sample_tape(track, track_len, t):
+    """Is a tone on at time t (seconds) on the given tape? Bounds-safe."""
+    if track is None or t < 0:
+        return False
+    i = int(t * TRACK_HZ)
+    if 0 <= i < track_len:
+        return bool(track[i])
+    return False
+
+
+def fmt_time(secs):
+    secs = max(0, int(secs))
+    return f"{secs // 60:01d}:{secs % 60:02d}"
+
+
+# ─────────────────────────────── the app ───────────────────────────────────
+
+MENU, SELECT, RECORD = "menu", "select", "record"
+
+# drawing glyphs — Unicode by default, swapped to ASCII on non-UTF-8 terminals
+BLOCK, V, H = "█", "│", "─"
+TL, TR, BL, BR = "┌", "┐", "└", "┘"
+CARET, AXIS = "▼", "·"
+
+
+def use_ascii_glyphs():
+    """Fall back to ASCII so the tape/frames still draw on a non-UTF-8 terminal."""
+    global BLOCK, V, H, TL, TR, BL, BR, CARET, AXIS
+    BLOCK, V, H = "#", "|", "-"
+    TL = TR = BL = BR = "+"
+    CARET, AXIS = "v", "."
+
+# CSI escape tails → normalized arrow tokens (some terminals send ESC O x instead
+# of ESC [ x in application-cursor mode, so we map both).
+_ESC_SEQ = {"[A": "UP", "[B": "DOWN", "[C": "RIGHT", "[D": "LEFT",
+            "OA": "UP", "OB": "DOWN", "OC": "RIGHT", "OD": "LEFT"}
+
+
+class App:
+    def __init__(self, scr):
+        self.scr = scr
+        curses.curs_set(0)
+        scr.keypad(True)
+        try:
+            curses.set_escdelay(25)   # disambiguate a lone ESC from arrow keys fast
+        except (curses.error, AttributeError):
+            pass
+        self._init_colors()
+        self._timeout = -1
+        # special curses keycodes → normalized tokens (used when keypad DOES decode)
+        self._keymap = {
+            curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN",
+            curses.KEY_LEFT: "LEFT", curses.KEY_RIGHT: "RIGHT",
+            curses.KEY_ENTER: "\n", curses.KEY_BACKSPACE: "\x7f",
+        }
+
+        # audio: mixer only, no display/window
+        self.audio = True
+        try:
+            pygame.mixer.init(RATE, -16, 1, 512)
+        except Exception:                            # noqa: BLE001 — degrade silently
+            self.audio = False
+        self.dot_snd = self.dash_snd = None
+
+        # recording style (pitch / speed / timbre / decay) — restored from session
+        (self.pitch_i, self.speed_i, self.wave_i,
+         self.shape_i) = self._load_settings()
+        self._apply_style()
+
+        self.cheat_lines = self._load_cheatsheet()
+
+        self.state = MENU
+        self.menu_idx = 0
+        self.show_cheat = False
+        self.status = ""
+        self.running = True
+        self.last = time.monotonic()
+
+        # select
+        self.tmp_wav = None
+        self.sel_track = None
+        self.sel_len = 0
+        self.sel_duration = 0.0
+        self.sel_head = 0.0
+        self.sel_playing = False
+
+        # record — a composed timeline stored in units: list of (type, gap_before)
+        self.rec = []
+        self.last_press = 0.0
+
+    # ---- setup ----
 
     @property
-    def stamp(self) -> str:
-        return time.strftime("%H:%M", time.localtime(self.ts))
+    def freq(self):
+        return PITCHES[self.pitch_i]
 
+    @property
+    def wave(self):
+        return WAVES[self.wave_i]
 
-def load_messages() -> list[MorseMessage]:
-    if not STORE.exists():
-        return []
-    try:
-        return [MorseMessage(**m) for m in json.loads(STORE.read_text())]
-    except Exception:
-        return []
+    @property
+    def unit(self):
+        return SPEEDS[self.speed_i][1]
 
+    @property
+    def attack(self):
+        return SHAPES[self.shape_i][1]
 
-def save_messages(messages: list[MorseMessage]) -> None:
-    try:
-        STORE.write_text(json.dumps([asdict(m) for m in messages], indent=2))
-    except Exception:
-        pass
+    @property
+    def release(self):
+        return SHAPES[self.shape_i][2]
 
+    def _apply_style(self):
+        """Regenerate the dot/dash beeps for the current pitch/speed/timbre/decay."""
+        if not self.audio:
+            return
+        self.dot_snd = float_to_sound(
+            make_tone(self.unit, self.freq, self.wave, 0.5, self.attack, self.release))
+        self.dash_snd = float_to_sound(
+            make_tone(3 * self.unit, self.freq, self.wave, 0.5, self.attack, self.release))
 
-# --------------------------------------------------------------------------- #
-# WebRTC signaling helpers (manual copy/paste, no server)                      #
-# --------------------------------------------------------------------------- #
-
-def rtc_config() -> RTCConfiguration:
-    return RTCConfiguration(iceServers=[
-        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-        RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
-    ])
-
-
-def sdp_to_blob(desc: RTCSessionDescription) -> str:
-    raw = json.dumps({"sdp": desc.sdp, "type": desc.type}).encode()
-    return base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode()
-
-
-def blob_to_desc(blob: str) -> RTCSessionDescription:
-    raw = zlib.decompress(base64.urlsafe_b64decode(blob.strip().encode()))
-    obj = json.loads(raw)
-    return RTCSessionDescription(sdp=obj["sdp"], type=obj["type"])
-
-
-async def wait_ice_complete(pc: RTCPeerConnection) -> None:
-    """aiortc has no trickle ICE — gather fully, then read localDescription."""
-    if pc.iceGatheringState == "complete":
-        return
-    done = asyncio.Event()
-
-    @pc.on("icegatheringstatechange")
-    def _on_change() -> None:
-        if pc.iceGatheringState == "complete":
-            done.set()
-
-    if pc.iceGatheringState == "complete":     # guard against a race
-        return
-    await done.wait()
-
-
-# --------------------------------------------------------------------------- #
-# Auto-connect config + signaling rendezvous (ntfy.sh public broker)           #
-# --------------------------------------------------------------------------- #
-#
-# The broker only relays the SDP handshake (offer/answer) on a topic derived
-# from your shared secret — it never sees your messages, which flow directly
-# peer-to-peer over the encrypted WebRTC channel. Both people put each other's
-# names + the SAME secret in config.json; the one whose name sorts first is the
-# offerer. Once configured, opening the app reconnects on its own.
-
-CONFIG = Path(__file__).resolve().parent / "config.json"
-NTFY = "https://ntfy.sh"
-
-
-def load_config() -> dict | None:
-    """Return a valid {name, peer, secret} config, or None (writing a template
-    on first run so the user has something to fill in)."""
-    if not CONFIG.exists():
+    def _load_settings(self):
+        """Restore the style indices saved last session (defaults if absent/bad)."""
+        idx = {"pitch_i": 3, "speed_i": 2, "wave_i": 0, "shape_i": 1}
+        sizes = {"pitch_i": len(PITCHES), "speed_i": len(SPEEDS),
+                 "wave_i": len(WAVES), "shape_i": len(SHAPES)}
         try:
-            CONFIG.write_text(json.dumps({
-                "name": getpass.getuser() or "me",
-                "peer": "",
-                "secret": secrets.token_urlsafe(12),
-                "_help": "Put her name in 'peer'; share this exact 'secret' "
-                         "with her (she swaps name/peer in her own config). "
-                         "Then both of you just open the app.",
-            }, indent=2))
-        except Exception:
+            with open(SETTINGS, encoding="utf-8") as fh:
+                data = json.load(fh)
+            for key in idx:
+                val = int(data[key])
+                if 0 <= val < sizes[key]:
+                    idx[key] = val
+        except (OSError, ValueError, KeyError, TypeError):
             pass
-        return None
-    try:
-        cfg = json.loads(CONFIG.read_text())
-    except Exception:
-        return None
-    if cfg.get("name") and cfg.get("peer") and cfg.get("secret"):
-        return cfg
-    return None
+        return idx["pitch_i"], idx["speed_i"], idx["wave_i"], idx["shape_i"]
 
-
-# --------------------------------------------------------------------------- #
-# Textual messages (network callbacks -> UI thread)                            #
-# --------------------------------------------------------------------------- #
-
-class OfferReady(Message):
-    def __init__(self, blob: str) -> None:
-        self.blob = blob
-        super().__init__()
-
-
-class AnswerReady(Message):
-    def __init__(self, blob: str) -> None:
-        self.blob = blob
-        super().__init__()
-
-
-class ConnState(Message):
-    def __init__(self, state: str) -> None:
-        self.state = state
-        super().__init__()
-
-
-class Incoming(Message):
-    def __init__(self, payload: dict) -> None:
-        self.payload = payload
-        super().__init__()
-
-
-# --------------------------------------------------------------------------- #
-# The glowing dot                                                              #
-# --------------------------------------------------------------------------- #
-
-GRID_W, GRID_H = 27, 11
-_RAMP = "  ..::--==++**##@@"
-
-
-def _build_falloff() -> list[list[float]]:
-    cx, cy = (GRID_W - 1) / 2, (GRID_H - 1) / 2
-    radius = 5.6
-    grid = []
-    for y in range(GRID_H):
-        row = []
-        for x in range(GRID_W):
-            dx = (x - cx) * 0.5           # cells are ~2x taller than wide
-            dy = y - cy
-            d = math.hypot(dx, dy)
-            row.append(max(0.0, 1.0 - d / radius) ** 1.3)
-        grid.append(row)
-    return grid
-
-
-_FALLOFF = _build_falloff()
-
-
-def _glow_color(intensity: float) -> Color:
-    """Warm amber/gold ember that whitens at full brightness (telegraph vibe)."""
-    i = max(0.0, min(1.0, intensity))
-    r = int(70 + 150 * i + 35 * i ** 3)
-    g = int(35 + 150 * i + 70 * i ** 3)
-    b = int(8 + 50 * i + 130 * i ** 3)
-    return Color.from_rgb(min(r, 255), min(g, 255), min(b, 255))
-
-
-class Dot(Widget):
-    """A single glowing point. Drive it by setting .target while .active=True."""
-
-    DEFAULT_CSS = "Dot { height: 11; content-align: center middle; }"
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.brightness = 0.06
-        self.target = 0.06
-        self.active = False
-        self._phase = 0.0
-
-    def on_mount(self) -> None:
-        self.set_interval(1 / 30, self._tick)
-
-    def _tick(self) -> None:
-        self._phase += 0.06
-        if not self.active:
-            # gentle idle ember so the dot always feels alive
-            self.target = 0.06 + 0.05 * (0.5 + 0.5 * math.sin(self._phase))
-        # ease toward the target for a glow rather than a hard on/off
-        self.brightness += (self.target - self.brightness) * 0.55
-        self.refresh()
-
-    def render(self) -> Text:
-        b = self.brightness
-        text = Text(justify="center")
-        for row in _FALLOFF:
-            for f in row:
-                inten = b * f
-                if inten < 0.05:
-                    text.append(" ")
-                else:
-                    idx = min(len(_RAMP) - 1, int(inten * (len(_RAMP) - 1)))
-                    text.append(_RAMP[idx], Style(color=_glow_color(inten)))
-            text.append("\n")
-        return text
-
-
-# --------------------------------------------------------------------------- #
-# Bottom panels (the swappable monospace menu)                                 #
-# --------------------------------------------------------------------------- #
-
-class MainPanel(Static):
-    can_focus = True
-
-    def show(self, unread: int) -> None:
-        badge = f"  [b red]({unread})[/b red]" if unread else ""
-        self.update(
-            "[b]MORSE[/b]  ::  pick an option\n\n"
-            "  [b]1[/b]  record a message\n"
-            f"  [b]2[/b]  received messages{badge}\n"
-            "  [b]c[/b]  connect to her (no ssh)\n"
-            "  [b]q[/b]  quit"
-        )
-
-
-class RecordPanel(Static):
-    can_focus = True
-
-    def reset(self) -> None:
-        self.letter: list[str] = []     # current letter being keyed (./-)
-        self.letters: list[str] = []    # committed Morse letters / "/" markers
-        self.started = time.time()
-        self.composing = False
-        self.refresh_view()
-
-    def add_symbol(self, sym: str) -> None:
-        self.letter.append(sym)
-        self.refresh_view()
-
-    def commit_letter(self) -> None:
-        if self.letter:
-            self.letters.append("".join(self.letter))
-            self.letter = []
-        self.refresh_view()
-
-    def add_word_gap(self) -> None:
-        self.commit_letter()
-        if self.letters and self.letters[-1] != "/":
-            self.letters.append("/")
-        self.refresh_view()
-
-    def backspace(self) -> None:
-        if self.letter:
-            self.letter.pop()
-        elif self.letters:
-            self.letters.pop()
-        self.refresh_view()
-
-    def current_morse(self) -> str:
-        parts = list(self.letters)
-        if self.letter:
-            parts.append("".join(self.letter))
-        out = " ".join(parts).replace(" / ", " / ").replace("/", "/")
-        # normalise "/" tokens into proper word separators
-        return " ".join(p for p in out.split())
-
-    def refresh_view(self) -> None:
-        morse = self.current_morse()
-        decoded = morse_to_text(morse) if morse else ""
-        elapsed = int(time.time() - self.started)
-        live = ("".join(self.letter)) or "…"
-        self.update(
-            f"[b red]● REC[/b red]  {elapsed:>3}s     keying letter: [b]{live}[/b]\n\n"
-            f"  morse  : {morse or '(empty)'}\n"
-            f"  decoded: [b]{decoded or '(empty)'}[/b]\n\n"
-            "  [b].[/b]/[b]j[/b] dot   [b]-[/b]/[b]k[/b] dash   [b]space[/b] next letter   "
-            "[b]w[/b] word gap\n"
-            "  [b]⌫[/b] undo   [b]enter[/b] send   [b]esc[/b] cancel"
-        )
-
-
-class MessagesPanel(Static):
-    can_focus = True
-
-    def show(self, messages: list[MorseMessage], selected: int) -> None:
-        if not messages:
-            self.update(
-                "[b]RECEIVED MESSAGES[/b]\n\n  (nothing yet)\n\n  [b]esc[/b] back"
-            )
-            return
-        lines = ["[b]RECEIVED MESSAGES[/b]  ::  ↑↓ select   "
-                 "[b]enter[/b] replay   [b]esc[/b] back\n"]
-        for i, m in enumerate(messages):
-            arrow = "[b]▸[/b]" if i == selected else " "
-            tag = "← recv" if m.direction == "recv" else "→ sent"
-            label = m.text or "(·)"
-            line = f" {arrow} {m.stamp}  {tag}  [b]{label}[/b]"
-            if i == selected:
-                line = f"[reverse]{line}[/reverse]"
-            lines.append(line)
-        self.update("\n".join(lines))
-
-
-class ConnectPanel(Static):
-    """Copy/paste WebRTC handshake UI."""
-
-    def compose(self) -> ComposeResult:
-        yield Static(id="cx-auto")
-        yield Static(id="cx-info")
-        with Horizontal(id="cx-buttons"):
-            yield Button("Create invite", id="cx-offer", variant="success")
-            yield Button("Join with invite", id="cx-join", variant="primary")
-        yield Static("Your code (send this to your contact):", classes="cx-label")
-        yield TextArea("", id="cx-out", read_only=True)
-        yield Button("Save code to file", id="cx-save")
-        yield Static("Paste the code you received:", classes="cx-label")
-        yield TextArea("", id="cx-in")
-        yield Button("Connect", id="cx-go", variant="warning")
-        yield Static("", id="cx-status")
-
-    def on_mount(self) -> None:
-        self.query_one("#cx-info", Static).update(
-            "[b]MANUAL HANDSHAKE[/b] (fallback)  ::  one of you presses [b]Create\n"
-            "invite[/b] and sends the code; the other presses [b]Join with invite[/b],\n"
-            "pastes it, and sends the answer back.  If your network blocks\n"
-            "peer-to-peer (office / carrier NAT), try home Wi-Fi or a phone hotspot."
-        )
-
-
-# --------------------------------------------------------------------------- #
-# The app                                                                      #
-# --------------------------------------------------------------------------- #
-
-class MorseApp(App):
-    CSS = """
-    Screen { align: center top; }
-    #status { height: 1; color: $text-muted; content-align: center middle; }
-    #panels { height: auto; padding: 1 2; }
-    MainPanel, RecordPanel, MessagesPanel { height: auto; padding: 1 2; }
-    ConnectPanel { height: auto; padding: 1 2; }
-    .cx-label { color: $text-muted; margin-top: 1; }
-    #cx-out, #cx-in { height: 4; }
-    #cx-buttons { height: auto; }
-    Button { margin: 0 1; }
-    """
-
-    BINDINGS = [("ctrl+c", "quit", "quit")]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.mode = "main"
-        self.messages: list[MorseMessage] = load_messages()
-        self.selected = 0
-        self.unread = 0
-        self.playing = False
-        self.pc: RTCPeerConnection | None = None
-        self.channel: RTCDataChannel | None = None
-        self.role: str | None = None
-        self.conn = "offline"
-        self.auto: dict | None = None
-        self.is_offerer = False
-        self._connected: asyncio.Event | None = None
-        self._sig_in: asyncio.Queue | None = None
-
-    # -- layout ----------------------------------------------------------- #
-
-    def compose(self) -> ComposeResult:
-        yield Dot()
-        yield Static("offline", id="status")
-        with ContentSwitcher(initial="main", id="panels"):
-            yield MainPanel(id="main")
-            yield RecordPanel(id="record")
-            yield MessagesPanel(id="messages")
-            yield ConnectPanel(id="connect")
-
-    def on_mount(self) -> None:
-        self.dot = self.query_one(Dot)
-        self._connected = asyncio.Event()
-        self._sig_in = asyncio.Queue()
-        self.set_interval(20.0, self._keepalive)
-        self.auto = load_config()
-        self.switch_to("main")
-        self.refresh_auto_line()
-        if self.auto:
-            self.auto_connect()
-
-    def update_status(self) -> None:
-        self.query_one("#status", Static).update(f"link: {self.conn}")
-        self.refresh_auto_line()
-
-    def refresh_auto_line(self) -> None:
+    def _save_settings(self):
         try:
-            line = self.query_one("#cx-auto", Static)
-        except Exception:
-            return
-        if self.auto:
-            role = "host" if self.is_offerer else "guest"
-            line.update(
-                f"[b]AUTO-CONNECT[/b]  {self.auto['name']} ↔ {self.auto['peer']}"
-                f"  ({role})  ::  link {self.conn}\n")
-        else:
-            line.update(
-                "[b]AUTO-CONNECT: off[/b]  ::  set [b]peer[/b] in config.json and share "
-                "its [b]secret[/b]\nwith her to enable hands-free reconnect. Manual "
-                "handshake below works now.\n")
-
-    def switch_to(self, mode: str) -> None:
-        self.mode = mode
-        self.query_one(ContentSwitcher).current = mode
-        if mode == "record":
-            self.query_one(RecordPanel).reset()
-            self.query_one(RecordPanel).focus()
-        elif mode == "messages":
-            self.unread = 0
-            self.selected = min(self.selected, max(0, len(self.messages) - 1))
-            self.query_one(MessagesPanel).show(self.messages, self.selected)
-            self.query_one(MessagesPanel).focus()
-        elif mode == "main":
-            self.query_one(MainPanel).show(self.unread)
-            self.query_one(MainPanel).focus()
-        self.update_status()
-
-    # -- key routing ------------------------------------------------------ #
-
-    def on_key(self, event: events.Key) -> None:
-        if isinstance(self.focused, TextArea):
-            return  # let the connect-panel paste boxes type freely
-
-        key = event.key
-        if key == "s" and self.playing:
-            self.stop_playback()
-            event.stop()
-            return
-
-        if self.mode == "main":
-            self._key_main(event)
-        elif self.mode == "record":
-            self._key_record(event)
-        elif self.mode == "messages":
-            self._key_messages(event)
-        elif self.mode == "connect" and key == "escape":
-            self.switch_to("main")
-            event.stop()
-
-    def _key_main(self, event: events.Key) -> None:
-        k = event.key
-        if k == "1":
-            self.switch_to("record")
-        elif k == "2":
-            self.switch_to("messages")
-        elif k == "c":
-            self.switch_to("connect")
-        elif k == "q":
-            self.action_quit()
-        else:
-            return
-        event.stop()
-
-    def _key_record(self, event: events.Key) -> None:
-        panel = self.query_one(RecordPanel)
-        k = event.key
-        if k in (".", "j", "full_stop"):
-            panel.add_symbol(".")
-            self.flash_symbol(".")
-        elif k in ("-", "k", "minus"):
-            panel.add_symbol("-")
-            self.flash_symbol("-")
-        elif k == "space":
-            panel.commit_letter()
-        elif k == "w":
-            panel.add_word_gap()
-        elif k == "backspace":
-            panel.backspace()
-        elif k == "enter":
-            self.send_recorded()
-        elif k == "escape":
-            self.switch_to("main")
-        else:
-            return
-        event.stop()
-
-    def _key_messages(self, event: events.Key) -> None:
-        k = event.key
-        if not self.messages:
-            if k == "escape":
-                self.switch_to("main")
-                event.stop()
-            return
-        if k in ("up", "k"):
-            self.selected = (self.selected - 1) % len(self.messages)
-        elif k in ("down", "j"):
-            self.selected = (self.selected + 1) % len(self.messages)
-        elif k == "enter":
-            self.play_message(self.messages[self.selected])
-        elif k == "escape":
-            self.switch_to("main")
-            event.stop()
-            return
-        else:
-            return
-        self.query_one(MessagesPanel).show(self.messages, self.selected)
-        event.stop()
-
-    # -- recording / sending ---------------------------------------------- #
-
-    def send_recorded(self) -> None:
-        panel = self.query_one(RecordPanel)
-        panel.commit_letter()
-        morse = panel.current_morse()
-        if not morse:
-            self.switch_to("main")
-            return
-        self.dispatch_message(morse_to_text(morse), morse)
-        self.switch_to("main")
-
-    def dispatch_message(self, text: str, morse: str) -> None:
-        msg = MorseMessage(
-            id=uuid.uuid4().hex, ts=time.time(),
-            text=text, morse=morse, direction="sent",
-        )
-        self.messages.append(msg)
-        save_messages(self.messages)
-        if self.channel is not None and self.channel.readyState == "open":
-            try:
-                self.channel.send(json.dumps(
-                    {"t": "msg", "text": text, "morse": morse}))
-            except Exception as exc:
-                self.notify(f"send failed: {exc}", severity="error")
-        else:
-            self.notify("not connected — nothing was sent",
-                        severity="warning")
-        self.play_message(msg)
-
-    # -- playback --------------------------------------------------------- #
-
-    def play_message(self, msg: MorseMessage) -> None:
-        self.play_morse(msg.morse)
-
-    @work(exclusive=True, group="player")
-    async def play_morse(self, morse: str) -> None:
-        self.playing = True
-        self.dot.active = True
-        try:
-            for is_on, units in morse_timeline(morse):
-                self.dot.target = 1.0 if is_on else 0.0
-                await asyncio.sleep(units * UNIT)
-        except asyncio.CancelledError:
+            with open(SETTINGS, "w", encoding="utf-8") as fh:
+                json.dump({"pitch_i": self.pitch_i, "speed_i": self.speed_i,
+                           "wave_i": self.wave_i, "shape_i": self.shape_i}, fh)
+        except OSError:
             pass
-        finally:
-            self.dot.target = 0.0
-            self.dot.active = False
-            self.playing = False
 
-    def stop_playback(self) -> None:
-        self.workers.cancel_group(self, "player")
-        self.dot.active = False
-        self.dot.target = 0.0
-        self.playing = False
+    def _init_colors(self):
+        # neutral: no colours, just plain/dim/bold/reverse so it reads like any
+        # ordinary terminal program.
+        self.NORM = curses.A_NORMAL
+        self.DIM = curses.A_DIM
+        self.HEAD = curses.A_BOLD
+        self.SEL = curses.A_REVERSE
 
-    @work(exclusive=True, group="flash")
-    async def flash_symbol(self, sym: str) -> None:
-        self.dot.active = True
-        self.dot.target = 1.0
-        await asyncio.sleep((3 if sym == "-" else 1) * UNIT)
-        self.dot.target = 0.0
-        await asyncio.sleep(UNIT)
-        self.dot.active = False
+    def _load_cheatsheet(self):
+        try:
+            with open(CHEATSHEET, encoding="utf-8") as fh:
+                return [ln.rstrip("\n") for ln in fh]
+        except OSError:
+            return ["cheatsheet.txt not found"]
 
-    def _keepalive(self) -> None:
-        if self.channel is not None and self.channel.readyState == "open":
+    # ---- low-level drawing ----
+
+    def put(self, y, x, s, attr=0):
+        # curses.error: off-screen write; UnicodeError: glyph the locale can't encode
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except (curses.error, UnicodeError):
+            pass
+
+    def frame(self, y, x, h, w, title=None):
+        self.put(y, x, TL + H * (w - 2) + TR)
+        for r in range(1, h - 1):
+            self.put(y + r, x, V)
+            self.put(y + r, x + w - 1, V)
+        self.put(y + h - 1, x, BL + H * (w - 2) + BR)
+        if title:
+            self.put(y, x + 2, f" {title} ")
+
+    # ---- input ----
+
+    def _set_timeout(self, v):
+        self._timeout = v
+        self.scr.timeout(v)
+
+    def read_key(self):
+        """One normalized key, or None on timeout.
+
+        We decode arrow/ESC sequences ourselves because keypad() doesn't reliably
+        reassemble them across terminals when an input timeout is set.
+        """
+        try:
+            k = self.scr.get_wch()
+        except (curses.error, ValueError):
+            return None
+        if isinstance(k, int):
+            return self._keymap.get(k, k)
+        if k == "\x1b":
+            self.scr.timeout(0)       # drain the rest of a CSI sequence, if any
+            seq = ""
             try:
-                self.channel.send(json.dumps({"t": "ka"}))
-            except Exception:
-                pass
-
-    # -- connection wiring ------------------------------------------------ #
-
-    def _wire_pc(self, pc: RTCPeerConnection) -> None:
-        @pc.on("connectionstatechange")
-        async def _on_state() -> None:
-            if pc is not self.pc:
-                return  # ignore events from a superseded connection
-            self.post_message(ConnState(pc.connectionState))
-
-    def _wire_channel(self, channel: RTCDataChannel) -> None:
-        self.channel = channel
-
-        @channel.on("open")
-        def _on_open() -> None:
-            if self._connected is not None:
-                self._connected.set()
-            self.post_message(ConnState("connected"))
-
-        @channel.on("message")
-        def _on_message(data) -> None:
-            try:
-                self.post_message(Incoming(json.loads(data)))
-            except Exception:
-                pass
-
-        @channel.on("close")
-        def _on_close() -> None:
-            self.post_message(ConnState("closed"))
-
-    @work(exclusive=True, group="webrtc")
-    async def start_offer(self) -> None:
-        self.role = "offer"
-        await self._reset_pc()
-        pc = RTCPeerConnection(rtc_config())
-        self.pc = pc
-        self._wire_pc(pc)
-        self._wire_channel(pc.createDataChannel("morse", ordered=True))
-        await pc.setLocalDescription(await pc.createOffer())
-        await wait_ice_complete(pc)
-        self.post_message(OfferReady(sdp_to_blob(pc.localDescription)))
-
-    @work(exclusive=True, group="webrtc")
-    async def start_answer(self, offer_blob: str) -> None:
-        self.role = "answer"
-        await self._reset_pc()
-        pc = RTCPeerConnection(rtc_config())
-        self.pc = pc
-        self._wire_pc(pc)
-
-        @pc.on("datachannel")
-        def _on_dc(channel: RTCDataChannel) -> None:
-            self._wire_channel(channel)
-
-        await pc.setRemoteDescription(blob_to_desc(offer_blob))
-        await pc.setLocalDescription(await pc.createAnswer())
-        await wait_ice_complete(pc)
-        self.post_message(AnswerReady(sdp_to_blob(pc.localDescription)))
-
-    @work(group="webrtc")
-    async def accept_answer(self, answer_blob: str) -> None:
-        if self.pc is None:
-            return
-        await self.pc.setRemoteDescription(blob_to_desc(answer_blob))
-
-    async def _reset_pc(self) -> None:
-        if self.pc is not None:
-            try:
-                await self.pc.close()
-            except Exception:
-                pass
-        self.pc = None
-        self.channel = None
-
-    # -- auto-connect via public broker (ntfy) ---------------------------- #
-
-    @work(exclusive=True, group="auto")
-    async def auto_connect(self) -> None:
-        cfg = self.auto
-        topic = f"morse-{cfg['secret']}"
-        me, peer = cfg["name"], cfg["peer"]
-        self.is_offerer = me < peer
-        self.conn = "searching…"
-        self.update_status()
-        async with aiohttp.ClientSession() as session:
-            sub = asyncio.create_task(self._sig_subscribe(session, topic, me))
-            try:
-                if self.is_offerer:
-                    await self._offerer_loop(session, topic, me)
-                else:
-                    await self._answerer_loop(session, topic, me)
+                for _ in range(4):
+                    try:
+                        c = self.scr.get_wch()
+                    except (curses.error, ValueError):
+                        break
+                    if isinstance(c, int):
+                        break
+                    seq += c
+                    if c.isalpha() or c == "~":
+                        break
             finally:
-                sub.cancel()
+                self.scr.timeout(self._timeout)
+            return _ESC_SEQ.get(seq, "\x1b")   # bare ESC if not an arrow
+        return k
 
-    async def _sig_publish(self, session, topic, obj) -> None:
-        try:
-            await session.post(
-                f"{NTFY}/{topic}", data=json.dumps(obj),
-                timeout=aiohttp.ClientTimeout(total=15))
-        except Exception:
-            pass
+    # ---- main loop ----
 
-    async def _sig_subscribe(self, session, topic, me) -> None:
-        url = f"{NTFY}/{topic}/json"
-        while True:
-            try:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=None)) as resp:
-                    async for raw in resp.content:
-                        raw = raw.strip()
-                        if not raw:
-                            continue
-                        try:
-                            evt = json.loads(raw)
-                            if evt.get("event") != "message":
-                                continue
-                            msg = json.loads(evt.get("message", ""))
-                        except Exception:
-                            continue
-                        if msg.get("from") == me:
-                            continue
-                        await self._sig_in.put(msg)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                await asyncio.sleep(3)   # stream dropped — reconnect
+    def run(self):
+        self._set_timeout(33)         # ~30 fps
+        while self.running:
+            k = self.read_key()
+            if k is not None:
+                self.on_key(k)
+            self.update()
+            self.render()
+        if self.audio:
+            pygame.mixer.quit()
 
-    async def _wait_sig(self, typ: str, timeout: float, sid: str | None):
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return None
-            try:
-                msg = await asyncio.wait_for(self._sig_in.get(), remaining)
-            except asyncio.TimeoutError:
-                return None
-            if msg.get("type") == typ and (sid is None or msg.get("sid") == sid):
-                return msg
+    def update(self):
+        now = time.monotonic()
+        dt = now - self.last
+        self.last = now
+        if self.state == SELECT and self.sel_playing:
+            self.sel_head += dt
+            if self.sel_head >= self.sel_duration:
+                self.sel_head = self.sel_duration
+                self.sel_playing = False
 
-    async def _offerer_loop(self, session, topic, me) -> None:
-        delays = [5, 5, 8, 13, 21]     # republish cadence; quick, then easing off
-        while True:
-            await self._reset_pc()
-            pc = RTCPeerConnection(rtc_config())
-            self.pc = pc
-            self._wire_pc(pc)
-            self._wire_channel(pc.createDataChannel("morse", ordered=True))
-            await pc.setLocalDescription(await pc.createOffer())
-            await wait_ice_complete(pc)
-            self._connected.clear()
-            self.conn = "searching…"
-            self.update_status()
-            sid = secrets.token_hex(4)
-            offer = {"from": me, "type": "offer", "sid": sid,
-                     "sdp": sdp_to_blob(pc.localDescription)}
-            connected = False
-            for d in delays:
-                await self._sig_publish(session, topic, offer)
-                ans = await self._wait_sig("answer", d, sid)
-                if not ans:
-                    continue
-                try:
-                    await pc.setRemoteDescription(blob_to_desc(ans["sdp"]))
-                    await asyncio.wait_for(self._connected.wait(), 15)
-                    connected = True
-                except Exception:
-                    connected = False
-                break
-            if connected:
-                while self._connected.is_set():   # hold until the link drops
-                    await asyncio.sleep(2)
+    # ---- key handling ----
+
+    @staticmethod
+    def _is_enter(k):
+        return k in ("\n", "\r")
+
+    @staticmethod
+    def _is_back(k):
+        return k in ("\x7f", "\b")
+
+    def on_key(self, k):
+        # cheatsheet toggle (terminals can't report key-release, so it's a toggle)
+        if k in ("c", "C") and self.state in (SELECT, RECORD):
+            self.show_cheat = not self.show_cheat
+            return
+        if self.show_cheat and k == "\x1b":
+            self.show_cheat = False
+            return
+
+        if self.state == MENU:
+            self.key_menu(k)
+        elif self.state == SELECT:
+            self.key_select(k)
+        elif self.state == RECORD:
+            self.key_record(k)
+
+    def key_menu(self, k):
+        if k == "UP":
+            self.menu_idx = (self.menu_idx - 1) % 2
+        elif k == "DOWN":
+            self.menu_idx = (self.menu_idx + 1) % 2
+        elif self._is_enter(k):
+            (self.start_select if self.menu_idx == 0 else self.start_record)()
+        elif k == "1":
+            self.menu_idx = 0
+            self.start_select()
+        elif k == "2":
+            self.menu_idx = 1
+            self.start_record()
+        elif k in ("q", "Q", "\x1b"):
+            self.running = False
+
+    def key_select(self, k):
+        if k == "\x1b":
+            self.stop_select()
+        elif k == " ":
+            self.toggle_play()
+        elif k == "LEFT":
+            self.seek(-3)
+        elif k == "RIGHT":
+            self.seek(3)
+
+    def key_record(self, k):
+        if k == "\x1b":
+            self.state = MENU
+            self.status = ""
+        elif k in (".", "j", "J"):
+            self.key_morse(".")
+        elif k in ("-", "k", "K"):
+            self.key_morse("-")
+        elif k in ("p", "P"):
+            self._cycle("pitch_i", PITCHES)
+        elif k in ("s", "S"):
+            self._cycle("speed_i", SPEEDS)
+        elif k in ("t", "T"):
+            self._cycle("wave_i", WAVES)
+        elif k in ("e", "E"):
+            self._cycle("shape_i", SHAPES)
+        elif self._is_back(k):
+            if self.rec:
+                self.rec.pop()
+                self.status = f"removed last element  ({len(self.rec)} left)"
             else:
-                await asyncio.sleep(8)            # regenerate a fresh offer
+                self.status = "nothing to remove"
+        elif self._is_enter(k):
+            self.save_record()
 
-    async def _answerer_loop(self, session, topic, me) -> None:
-        while True:
-            msg = await self._sig_in.get()
-            if msg.get("type") != "offer" or self._connected.is_set():
-                continue
-            await self._reset_pc()
-            pc = RTCPeerConnection(rtc_config())
-            self.pc = pc
-            self._wire_pc(pc)
+    # ---- select flow ----
 
-            @pc.on("datachannel")
-            def _on_dc(channel: RTCDataChannel) -> None:
-                self._wire_channel(channel)
+    def start_select(self):
+        path = self.browse()
+        if not path:
+            return
+        self.status = "decoding …"
+        self.render()
+        try:
+            self.tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+            convert_to_wav(path, self.tmp_wav)
+            samples, rate = load_wav(self.tmp_wav)
+            self.sel_track, self.sel_duration = detect_tape(samples, rate)
+            self.sel_len = len(self.sel_track)
+            self.sel_head = 0.0
+            self.sel_playing = self.audio
+            if self.audio:
+                pygame.mixer.music.load(self.tmp_wav)
+                pygame.mixer.music.play()
+            self.state = SELECT
+            self.status = os.path.basename(path)
+        except Exception as ex:                      # noqa: BLE001 — surface to UI
+            self.status = f"error: {ex}"
+            self.state = MENU
 
+    def stop_select(self):
+        if self.audio:
+            pygame.mixer.music.stop()
+        if self.tmp_wav and os.path.exists(self.tmp_wav):
+            os.unlink(self.tmp_wav)
+        self.tmp_wav = None
+        self.state = MENU
+        self.status = ""
+
+    def toggle_play(self):
+        if not self.audio:
+            return
+        self.sel_playing = not self.sel_playing
+        if self.sel_playing:
+            pygame.mixer.music.unpause()
+        else:
+            pygame.mixer.music.pause()
+
+    def seek(self, secs):
+        self.sel_head = max(0.0, min(self.sel_duration, self.sel_head + secs))
+        if self.audio:
             try:
-                await pc.setRemoteDescription(blob_to_desc(msg["sdp"]))
-                await pc.setLocalDescription(await pc.createAnswer())
-                await wait_ice_complete(pc)
-                await self._sig_publish(session, topic, {
-                    "from": me, "type": "answer", "sid": msg.get("sid"),
-                    "sdp": sdp_to_blob(pc.localDescription)})
-            except Exception:
+                pygame.mixer.music.play(start=self.sel_head)
+                if not self.sel_playing:
+                    pygame.mixer.music.pause()
+            except pygame.error:
                 pass
 
-    # -- connect-panel buttons ------------------------------------------- #
+    # ---- record flow ----
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id
-        status = self.query_one("#cx-status", Static)
-        if bid == "cx-offer":
-            self.workers.cancel_group(self, "auto")   # manual takes over
-            status.update("generating invite…")
-            self.start_offer()
-        elif bid == "cx-join":
-            self.workers.cancel_group(self, "auto")
-            self.role = "answer"
-            status.update("paste the invite below, then press Connect")
-        elif bid == "cx-go":
-            blob = self.query_one("#cx-in", TextArea).text.strip()
-            if not blob:
-                status.update("[red]paste a code first[/red]")
-                return
-            if self.role == "offer":
-                status.update("connecting…")
-                self.accept_answer(blob)
-            else:
-                status.update("generating answer…")
-                self.start_answer(blob)
-        elif bid == "cx-save":
-            self._save_code()
+    def start_record(self):
+        self.rec = []
+        self.last_press = 0.0
+        self.state = RECORD
+        self.status = "tap . and - to key; Enter to save"
 
-    def _save_code(self) -> None:
-        blob = self.query_one("#cx-out", TextArea).text.strip()
-        if not blob:
-            return
-        name = "invite.txt" if self.role == "offer" else "answer.txt"
-        path = Path(__file__).resolve().parent / name
-        path.write_text(blob)
-        self.query_one("#cx-status", Static).update(f"saved → {path.name}")
+    def _cycle(self, attr, options):
+        setattr(self, attr, (getattr(self, attr) + 1) % len(options))
+        self._apply_style()
+        self._save_settings()
+        self.status = (f"style: pitch {self.freq} Hz   speed {SPEEDS[self.speed_i][0]}"
+                       f"   tone {self.wave}   decay {SHAPES[self.shape_i][0]}")
 
-    # -- message handlers (UI thread) ------------------------------------- #
+    def _rec_timeline(self):
+        """The recording as (start_unit, len_unit) spans plus total length, all in
+        dot-units (1 = dot, 3 = dash) — for the tape, which is speed-independent."""
+        pos, out = 0.0, []
+        for entry in self.rec:
+            typ, gap_before = entry[0], entry[1]
+            pos += gap_before
+            length = 1.0 if typ == "." else 3.0
+            out.append((pos, length))
+            pos += length
+        return out, pos
 
-    def on_offer_ready(self, msg: OfferReady) -> None:
-        self.query_one("#cx-out", TextArea).text = msg.blob
-        self.query_one("#cx-status", Static).update(
-            "invite ready — email it, then paste their reply and press Connect")
+    def _rec_seconds(self):
+        """The timeline in seconds, each element carrying its own style.
 
-    def on_answer_ready(self, msg: AnswerReady) -> None:
-        self.query_one("#cx-out", TextArea).text = msg.blob
-        self.query_one("#cx-status", Static).update(
-            "answer ready — email it back; you'll connect once they paste it")
+        Every element uses the unit/pitch/timbre/decay that were active when it
+        was keyed, so a style change part-way through only affects later elements.
+        """
+        t, out = 0.0, []
+        for typ, gap_before, freq, wave, unit, attack, release in self.rec:
+            t += gap_before * unit
+            dur = (1.0 if typ == "." else 3.0) * unit
+            out.append((t, t + dur, freq, wave, attack, release))
+            t += dur
+        return out, t
 
-    def on_conn_state(self, msg: ConnState) -> None:
-        self.conn = msg.state
-        self.update_status()
-        if msg.state == "connected":
-            self.notify("connected — you're on the air", title="link up")
-            if self.mode == "connect":
-                self.switch_to("main")
-        elif msg.state in ("failed", "closed", "disconnected"):
-            if self._connected is not None:
-                self._connected.clear()
-            if msg.state == "failed" and not self.auto:
-                self.notify(
-                    "connection failed — a network may block P2P; "
-                    "try home Wi-Fi or a phone hotspot",
-                    severity="error", timeout=10)
-            self.channel = None
+    def _rec_end(self):
+        return self._rec_seconds()[1]
 
-    def on_incoming(self, msg: Incoming) -> None:
-        payload = msg.payload
-        if payload.get("t") == "ka":
-            return
-        text = payload.get("text", "")
-        morse = payload.get("morse", "")
-        if not morse:
-            return
-        m = MorseMessage(
-            id=uuid.uuid4().hex, ts=time.time(),
-            text=text, morse=morse, direction="recv",
-        )
-        self.messages.append(m)
-        save_messages(self.messages)
-        if self.mode == "messages":
-            # they're already looking at the list — refresh it, no badge
-            self.query_one(MessagesPanel).show(self.messages, self.selected)
+    def key_morse(self, typ):
+        """Append an element, separated from the previous one by a gap = the real
+        pause you took (in units), clamped to [1, 7] so fast taps never overlap.
+        The current pitch/speed/timbre are frozen into the element."""
+        now = time.monotonic()
+        if self.rec:
+            gap = min(7.0, max(1.0, (now - self.last_press) / self.unit))
         else:
-            self.unread += 1
-            if self.mode == "main":
-                self.query_one(MainPanel).show(self.unread)
+            gap = 0.0
+        self.rec.append((typ, gap, self.freq, self.wave, self.unit,
+                         self.attack, self.release))
+        self.last_press = now
+        snd = self.dot_snd if typ == "." else self.dash_snd
+        if self.audio and snd:
+            snd.play()
+        self.status = f"{len(self.rec)} elements"
 
-    # -- shutdown --------------------------------------------------------- #
+    def save_record(self):
+        if not self.rec:
+            self.status = "nothing recorded"
+            return
+        # default to morse.mp3, or morse_1.mp3, morse_2.mp3 … if that already exists
+        default = self._next_free_name("morse", ".mp3")
+        path = self.prompt_text("save as (full path):", default)
+        if not path:
+            self.status = "save cancelled"
+            return
+        if os.path.splitext(path)[1].lower() not in (".mp3", ".wav"):
+            path += ".mp3"
+        if os.path.exists(path):
+            if not self._confirm(f"{os.path.basename(path)} already exists - overwrite?"):
+                self.status = "not saved - existing file kept"
+                return
+        try:
+            events, _ = self._rec_seconds()   # each event carries its own style
+            export_morse(events, path)
+            self.status = f"saved: {path}"
+            self.state = MENU
+        except Exception as ex:                      # noqa: BLE001
+            self.status = f"save error: {ex}"
 
-    async def action_quit(self) -> None:
-        self.workers.cancel_group(self, "auto")
-        await self._reset_pc()
-        self.exit()
+    @staticmethod
+    def _next_free_name(base, ext):
+        """`<cwd>/base.ext`, or base_1.ext, base_2.ext … if earlier ones exist."""
+        path = os.path.join(os.getcwd(), base + ext)
+        i = 1
+        while os.path.exists(path):
+            path = os.path.join(os.getcwd(), f"{base}_{i}{ext}")
+            i += 1
+        return path
+
+    def _confirm(self, question):
+        """A blocking y/n modal. Returns True only on an explicit yes."""
+        self._set_timeout(-1)
+        try:
+            while True:
+                self.scr.erase()
+                R, C = self.scr.getmaxyx()
+                self.put(1, 2, "Save cassette", self.HEAD)
+                self.put(3, 2, question[:C - 4])
+                self.put(R - 2, 2, "y = overwrite    n / esc = keep the file", self.DIM)
+                self.scr.refresh()
+                k = self.read_key()
+                if k in ("y", "Y"):
+                    return True
+                if k in ("n", "N", "\x1b"):
+                    return False
+        finally:
+            self._set_timeout(33)
+            self.last = time.monotonic()
+
+    # ---- modal: keyboard file browser ----
+
+    def _list_dir(self, cwd):
+        items = [("..", True, os.path.dirname(cwd) or cwd)]
+        try:
+            names = sorted(os.listdir(cwd), key=str.lower)
+        except OSError:
+            names = []
+        for n in names:
+            if n.startswith("."):
+                continue
+            full = os.path.join(cwd, n)
+            if os.path.isdir(full):
+                items.append((n + "/", True, full))
+        for n in names:
+            if n.startswith("."):
+                continue
+            full = os.path.join(cwd, n)
+            if os.path.isfile(full) and os.path.splitext(n)[1].lower() in AUDIO_EXTS:
+                items.append((n, False, full))
+        return items
+
+    def browse(self):
+        self._set_timeout(-1)       # block for keys while browsing
+        cwd = os.getcwd()
+        idx = 0
+        try:
+            while True:
+                items = self._list_dir(cwd)
+                idx = max(0, min(idx, len(items) - 1))
+                self._render_browser(cwd, items, idx)
+                k = self.read_key()
+                if k == "UP":
+                    idx = (idx - 1) % len(items)
+                elif k == "DOWN":
+                    idx = (idx + 1) % len(items)
+                elif self._is_enter(k):
+                    name, is_dir, full = items[idx]
+                    if is_dir:
+                        cwd = os.path.normpath(full)
+                        idx = 0
+                    else:
+                        return full
+                elif k == "LEFT" or self._is_back(k):
+                    cwd = os.path.dirname(cwd) or cwd
+                    idx = 0
+                elif k == "\x1b":
+                    return None
+        finally:
+            self._set_timeout(33)
+            self.last = time.monotonic()
+
+    def _render_browser(self, cwd, items, idx):
+        self.scr.erase()
+        R, C = self.scr.getmaxyx()
+        self.put(1, 2, "Open cassette", self.HEAD)
+        self.put(2, 2, ("dir: " + cwd)[:C - 4], self.DIM)
+        top = 4
+        rows = R - 7
+        start = max(0, idx - rows + 1) if idx >= rows else 0
+        for i in range(start, min(len(items), start + rows)):
+            name, is_dir, _ = items[i]
+            y = top + (i - start)
+            mark = "> " if i == idx else "  "
+            self.put(y, 2, (mark + name)[:C - 4], self.SEL if i == idx else self.NORM)
+        self.put(R - 2, 2, "up/down move   enter open   left parent   esc cancel", self.DIM)
+        self.scr.refresh()
+
+    # ---- modal: keyboard text input ----
+
+    def prompt_text(self, title, default=""):
+        self._set_timeout(-1)       # block for keys while typing
+        curses.curs_set(1)
+        buf = list(default)
+        try:
+            while True:
+                self._render_prompt(title, "".join(buf))
+                k = self.read_key()
+                if self._is_enter(k):
+                    return "".join(buf).strip() or None
+                if k == "\x1b":
+                    return None
+                if self._is_back(k):
+                    if buf:
+                        buf.pop()
+                elif isinstance(k, str) and len(k) == 1 and k.isprintable():
+                    buf.append(k)
+        finally:
+            curses.curs_set(0)
+            self._set_timeout(33)
+            self.last = time.monotonic()
+
+    def _render_prompt(self, title, text):
+        self.scr.erase()
+        R, C = self.scr.getmaxyx()
+        self.put(1, 2, "Save cassette", self.HEAD)
+        self.put(3, 2, title)
+        self.put(4, 2, "> ")
+        self.put(4, 4, text[-(C - 8):])
+        self.put(R - 2, 2, "type a path   enter save   esc cancel", self.DIM)
+        self.scr.refresh()
+
+    # ---- rendering ----
+
+    def render(self):
+        self.scr.erase()
+        R, C = self.scr.getmaxyx()
+        if R < 16 or C < 56:
+            self.put(0, 0, "enlarge terminal (min 56x16)")
+            self.scr.refresh()
+            return
+
+        if self.state == MENU:
+            self._render_menu(R, C)
+        elif self.state == SELECT:
+            self._render_player(R, C, "Select Cassette", self.sel_head)
+        elif self.state == RECORD:
+            self._render_player(R, C, "Record Cassette", self._rec_end())
+        if self.show_cheat:
+            self._render_cheat(R, C)
+        self.scr.refresh()
+
+    def _render_menu(self, R, C):
+        self.put(1, 2, "morse - cassette deck", self.HEAD)
+        labels = ["Select Cassette", "Record Cassette"]
+        subs = ["browse to an audio file, read the tape",
+                "key it by hand, save as mp3 / wav"]
+        for i, (lab, sub) in enumerate(zip(labels, subs)):
+            y = 3 + i * 2
+            sel = i == self.menu_idx
+            mark = ">" if sel else " "
+            self.put(y, 2, f"{mark} {i + 1}) {lab}", self.HEAD if sel else self.NORM)
+            self.put(y, 26, sub, self.DIM)
+        if self.status:
+            self.put(8, 2, self.status[:C - 4])
+        self.put(R - 2, 2, "up/down select   enter open   1/2 jump   q quit", self.DIM)
+
+    def _render_player(self, R, C, title, head):
+        overview = self.state == SELECT and self.sel_track is not None
+        if self.state == RECORD:
+            title += "   [REC]"
+        self.put(1, 2, title, self.HEAD)
+        self.put(2, 2, self.status[:C - 4], self.DIM)
+
+        ty, tx = 4, 2
+        tw = C - 4
+        th = max(4, R - (11 if overview else 8))
+        self.frame(ty, tx, th, tw)
+        cols = self._tape_columns(tw - 4, head)
+        self._paint_tape(ty + 1, tx + 2, th - 2, cols)
+
+        iy = ty + th
+        if self.state == SELECT:
+            self.put(iy, 2, f"{fmt_time(head)} / {fmt_time(self.sel_duration)}")
+            keys = "space play/pause   left/right seek   c cheatsheet   esc back"
+        else:
+            style = (f"pitch {self.freq}Hz   speed {SPEEDS[self.speed_i][0]}   "
+                     f"tone {self.wave}   decay {SHAPES[self.shape_i][0]}   "
+                     f"[p/s/t/e change]")
+            self.put(iy, 2, f"{len(self.rec)} elements   length {fmt_time(head)}")
+            self.put(iy + 1, 2, style[:C - 4], self.DIM)
+            keys = ". / j dot   - / k dash   bksp undo   enter save   c cheatsheet   esc cancel"
+
+        if overview:
+            self._render_overview(iy + 2, tx + 2, tw - 4, head)
+
+        self.put(R - 2, 2, keys[:C - 4], self.DIM)
+
+    def _render_overview(self, oy, x, w, head):
+        """A compressed map of the whole track. The pointer sits in the middle =
+        'now'; the band slides under it (past on the left, upcoming on the right)
+        and jumps when you seek."""
+        center = w // 2
+        dur = self.sel_duration
+        ocps = max(2.0, min(10.0, w / max(dur, 1.0)))   # zoom: fit short tracks
+        self.put(oy, x + center, CARET, self.HEAD)
+        for j in range(w):
+            t = head + (j - center) / ocps
+            if t < 0 or t > dur:
+                continue                                # off either end: blank
+            if sample_tape(self.sel_track, self.sel_len, t):
+                self.put(oy + 1, x + j, BLOCK)
+            else:
+                self.put(oy + 1, x + j, AXIS, self.DIM)
+
+    def _tape_columns(self, w, head):
+        """A boolean column per character cell, rightmost = `head`.
+
+        Record draws each element as a fixed-width span (so every dot is the same
+        width, no sampling jitter); Select point-samples the decoded envelope.
+        """
+        cols = [False] * w
+        if self.state == RECORD:
+            # work in units so element widths stay fixed (dot=2, dash=6) at any speed
+            spans, total = self._rec_timeline()
+            u_left = total - (w - 1) / CPU
+            for s, length in spans:
+                c0 = int(round((s - u_left) * CPU))
+                cw = max(1, int(round(length * CPU)))
+                for j in range(max(0, c0), min(w, c0 + cw)):
+                    cols[j] = True
+        else:
+            for j in range(w):
+                t = head - (w - 1 - j) / CPS
+                if t >= 0 and sample_tape(self.sel_track, self.sel_len, t):
+                    cols[j] = True
+        return cols
+
+    def _paint_tape(self, y, x, h, cols):
+        mid = h // 2
+        for j, on in enumerate(cols):
+            if on:
+                for r in range(h):
+                    self.put(y + r, x + j, BLOCK)
+            elif j % 2 == 0:
+                self.put(y + mid, x + j, AXIS, self.DIM)
+
+    def _render_cheat(self, R, C):
+        w = min(40, C - 4)
+        x = C - w - 2
+        y, h = 1, R - 2
+        for r in range(h):                            # blank the panel area
+            self.put(y + r, x, " " * w)
+        self.frame(y, x, h, w, "cheatsheet")
+        yy = y + 1
+        for line in self.cheat_lines:
+            if yy >= y + h - 1:
+                break
+            self.put(yy, x + 2, line[:w - 4])
+            yy += 1
 
 
-def main() -> None:
-    MorseApp().run()
+def _terminal_is_unicode():
+    """Can the terminal's actual codeset (what curses encodes with) carry █?"""
+    cs = ""
+    try:
+        cs = locale.nl_langinfo(locale.CODESET)      # the codeset curses uses
+    except (AttributeError, ValueError):
+        cs = locale.getpreferredencoding(False) or ""
+    try:
+        "█".encode(cs or "ascii")
+        return True
+    except (LookupError, UnicodeError):
+        return False
+
+
+def main():
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    if not _terminal_is_unicode():
+        use_ascii_glyphs()                           # non-UTF-8 terminal (some SSH/macOS)
+    curses.wrapper(lambda scr: App(scr).run())
 
 
 if __name__ == "__main__":
