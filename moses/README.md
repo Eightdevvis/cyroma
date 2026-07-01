@@ -41,6 +41,7 @@ throwaway environment and starts the app. ffmpeg comes bundled via
 
 **Select Cassette** (player)
 - `SPACE` play / pause · `←`/`→` seek 3 s
+- `s` slow down (1x → 0.75x → 0.5x → 0.35x, pitch kept)
 - `c` cheatsheet · `ESC` back
 
 **Record Cassette**

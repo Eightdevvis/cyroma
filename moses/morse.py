@@ -15,7 +15,8 @@ Keyboard only, no mouse, no window. Two things:
 
   • Select Cassette — browse to an audio file (mp3/wav/…), then watch it play
     back as a scrolling tape of tones and pauses. No letters: short block = dot,
-    long block = dash, dark = pause. You translate it yourself.
+    long block = dash, dark = pause. You translate it yourself. Press  s  to
+    slow the playback down (pitch kept) when a cassette runs too fast to read.
 
   • Record Cassette — key Morse by hand ( . and - ), pauses included, hear every
     beep, then type a path and save it as an mp3 or wav.
@@ -34,6 +35,7 @@ import locale
 import curses
 import subprocess
 import tempfile
+import threading
 
 # Keep pygame silent and headless — we only use its audio mixer, never a window.
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -60,6 +62,10 @@ DOT, DASH = 0.09, 0.27      # default element lengths (s) — dash is 3× a dot
 TRACK_HZ = 100              # resolution of the on/off tape (samples per second)
 CPS = 22                    # Select tape scroll speed (columns per second)
 CPU = 2                     # Record tape: columns per unit (dot=2, dash=6)
+
+# Select playback speeds — a tempo slow-down (pitch preserved) for reading a
+# fast cassette. (label, factor); 1.0 = the cassette's own speed.
+SEL_SPEEDS = [("1x", 1.0), ("0.75x", 0.75), ("0.5x", 0.5), ("0.35x", 0.35)]
 
 # recording style presets (the "sound" of the cassette you make)
 PITCHES = [300, 400, 500, 600, 700, 800, 1000, 1200]      # Hz
@@ -112,6 +118,24 @@ def _run_ffmpeg(args):
 def convert_to_wav(src, dst, rate=RATE):
     """Decode any audio file into a mono PCM wav at `rate` via ffmpeg."""
     _run_ffmpeg(["-i", src, "-ac", "1", "-ar", str(rate), dst])
+
+
+def _atempo_chain(speed):
+    """An ffmpeg atempo filter string that slows tempo to `speed` (pitch kept).
+
+    A single atempo only accepts 0.5–2.0, so factors below 0.5 are reached by
+    chaining (e.g. 0.35 → atempo=0.5,atempo=0.7)."""
+    factors, s = [], speed
+    while s < 0.5 - 1e-9:
+        factors.append(0.5)
+        s /= 0.5
+    factors.append(s)
+    return ",".join(f"atempo={f:.4f}" for f in factors)
+
+
+def tempo_wav(src, dst, speed):
+    """Write `src` slowed to `speed` (tempo only, pitch unchanged) via ffmpeg."""
+    _run_ffmpeg(["-i", src, "-filter:a", _atempo_chain(speed), dst])
 
 
 def load_wav(path):
@@ -275,7 +299,14 @@ class App:
         self.last = time.monotonic()
 
         # select
-        self.tmp_wav = None
+        self.tmp_wav = None            # original-rate decoded wav (== speed 1x)
+        self.sel_speed_i = 0           # index into SEL_SPEEDS
+        # slowed variants are pre-rendered in a background thread on open, so
+        # switching speed just swaps in a ready file (no ffmpeg on the keypress)
+        self.speed_wavs = {}           # speed_i -> ready wav path
+        self._speed_lock = threading.Lock()
+        self._speed_thread = None
+        self._speed_cancel = False
         self.sel_track = None
         self.sel_len = 0
         self.sel_duration = 0.0
@@ -429,7 +460,7 @@ class App:
         dt = now - self.last
         self.last = now
         if self.state == SELECT and self.sel_playing:
-            self.sel_head += dt
+            self.sel_head += dt * self._speed()   # slowed playback → head crawls
             if self.sel_head >= self.sel_duration:
                 self.sel_head = self.sel_duration
                 self.sel_playing = False
@@ -485,6 +516,8 @@ class App:
             self.seek(-3)
         elif k == "RIGHT":
             self.seek(3)
+        elif k in ("s", "S"):
+            self.cycle_speed()
 
     def key_record(self, k):
         if k == "\x1b":
@@ -527,9 +560,10 @@ class App:
             self.sel_len = len(self.sel_track)
             self.sel_head = 0.0
             self.sel_playing = self.audio
-            if self.audio:
-                pygame.mixer.music.load(self.tmp_wav)
-                pygame.mixer.music.play()
+            self.sel_speed_i = 0
+            self.speed_wavs = {0: self.tmp_wav}
+            self._start_prerender()
+            self._play_from(0.0)
             self.state = SELECT
             self.status = os.path.basename(path)
         except Exception as ex:                      # noqa: BLE001 — surface to UI
@@ -539,11 +573,84 @@ class App:
     def stop_select(self):
         if self.audio:
             pygame.mixer.music.stop()
-        if self.tmp_wav and os.path.exists(self.tmp_wav):
-            os.unlink(self.tmp_wav)
+        self._speed_cancel = True                    # let the prerender thread bail
+        with self._speed_lock:
+            paths = set(self.speed_wavs.values())
+        paths.add(self.tmp_wav)
+        for p in paths:
+            if p and os.path.exists(p):
+                os.unlink(p)
+        self.speed_wavs = {}
         self.tmp_wav = None
         self.state = MENU
         self.status = ""
+
+    def _speed(self):
+        return SEL_SPEEDS[self.sel_speed_i][1]
+
+    def _start_prerender(self):
+        """Render every slowed variant of the current cassette in the background,
+        so a later speed change just loads a ready file — no pause on the key."""
+        if not self.audio:
+            return
+        self._speed_cancel = False
+        src = self.tmp_wav
+
+        def work():
+            for i, (_, factor) in enumerate(SEL_SPEEDS):
+                if factor >= 0.999 or self._speed_cancel:
+                    continue
+                out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                try:
+                    tempo_wav(src, out, factor)
+                except Exception:                    # noqa: BLE001 — skip this speed
+                    if os.path.exists(out):
+                        os.unlink(out)
+                    continue
+                with self._speed_lock:
+                    if self._speed_cancel:           # cassette closed mid-render
+                        if os.path.exists(out):
+                            os.unlink(out)
+                        return
+                    self.speed_wavs[i] = out
+
+        self._speed_thread = threading.Thread(target=work, daemon=True)
+        self._speed_thread.start()
+
+    def _current_wav(self):
+        with self._speed_lock:
+            return self.speed_wavs.get(self.sel_speed_i)
+
+    def _play_from(self, head):
+        """Cue the current speed's wav to `head` (original-track seconds), honoring
+        the paused state. Slowed files run on a stretched clock, so scale."""
+        if not self.audio:
+            return
+        path = self._current_wav()
+        if not path:
+            return
+        try:
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.play(start=head / self._speed())
+            if not self.sel_playing:
+                pygame.mixer.music.pause()
+        except pygame.error:
+            pass
+
+    def cycle_speed(self):
+        self.sel_speed_i = (self.sel_speed_i + 1) % len(SEL_SPEEDS)
+        label = SEL_SPEEDS[self.sel_speed_i][0]
+        self.status = f"speed {label}"
+        # variants are pre-rendered on open, so this is normally already there;
+        # only if the render hasn't caught up yet do we wait briefly.
+        if self.audio and self._speed() < 0.999 and self._current_wav() is None:
+            self.status = f"preparing {label} …"
+            self.render()
+            while self._current_wav() is None and not self._speed_cancel:
+                time.sleep(0.03)
+            self.status = f"speed {label}"
+            self.last = time.monotonic()             # don't count the wait as playback
+        self._play_from(self.sel_head)
 
     def toggle_play(self):
         if not self.audio:
@@ -556,13 +663,7 @@ class App:
 
     def seek(self, secs):
         self.sel_head = max(0.0, min(self.sel_duration, self.sel_head + secs))
-        if self.audio:
-            try:
-                pygame.mixer.music.play(start=self.sel_head)
-                if not self.sel_playing:
-                    pygame.mixer.music.pause()
-            except pygame.error:
-                pass
+        self._play_from(self.sel_head)
 
     # ---- record flow ----
 
@@ -832,8 +933,9 @@ class App:
 
         iy = ty + th
         if self.state == SELECT:
-            self.put(iy, 2, f"{fmt_time(head)} / {fmt_time(self.sel_duration)}")
-            keys = "space play/pause   left/right seek   c cheatsheet   esc back"
+            self.put(iy, 2, f"{fmt_time(head)} / {fmt_time(self.sel_duration)}"
+                            f"   speed {SEL_SPEEDS[self.sel_speed_i][0]}")
+            keys = "space play/pause   left/right seek   s slower   c cheatsheet   esc back"
         else:
             style = (f"pitch {self.freq}Hz   speed {SPEEDS[self.speed_i][0]}   "
                      f"tone {self.wave}   decay {SHAPES[self.shape_i][0]}   "
